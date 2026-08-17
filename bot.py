@@ -1,320 +1,135 @@
-import asyncio
 import logging
-import os
+import asyncio
 import sqlite3
-import time
-from datetime import datetime, date, timedelta
-
-from dotenv import load_dotenv
-from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart, Command
+import os
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+from aiogram import F, Router, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    TelegramObject,
-)
-from typing import Any, Awaitable, Callable, Dict
-
-# Google Calendar API
-from google_auth_oauthlib.flow import InstalledAppFlow
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from aiogram.filters.state import StateFilter
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from google.auth.transport.requests import Request
+from google.oauth2.service_account import Credentials
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
-import pickle
+from googleapiclient.errors import HttpError
+import aiosqlite
+from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
-ADMIN_CHAT_IDS = [
-    int(x) for x in os.getenv("ADMIN_CHAT_IDS", "0").split(",") if x.strip()
-]
-
-COMPANY_NAME = "GlobexTrans"
-DB_PATH = os.path.join(os.path.dirname(__file__), "globextrans.db")
-
-# Google Calendar
-CALENDAR_SCOPES = ['https://www.googleapis.com/auth/calendar']
-CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), "credentials.json")
-TOKEN_FILE = os.path.join(os.path.dirname(__file__), "token.pickle")
-CALENDAR_ID = os.getenv("CALENDAR_ID", "primary")
-
-FIXED_DEPARTURE_DATES = {
-    "ukraine": [date(2026, 8, 21), date(2026, 9, 4), date(2026, 9, 18), date(2026, 10, 2), date(2026, 10, 16)],
-    "germany": [date(2026, 8, 23), date(2026, 9, 6), date(2026, 9, 20), date(2026, 10, 4), date(2026, 10, 18)],
-}
-
-COUNTRY_LABELS = {"ukraine": "🇺🇦 Україна", "germany": "🇩🇪 Німеччина"}
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 router = Router()
 
-MAX_TEXT_LENGTH = 300
-THROTTLE_INTERVAL = 1.0
+DB_NAME = "globextrans.db"
+GOOGLE_CREDENTIALS_FILE = "service_account.json"
+CALENDAR_ID = "primary"
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN must be set in .env file")
 
-class ThrottlingMiddleware(BaseMiddleware):
-    def __init__(self):
-        self._last_seen: Dict[int, float] = {}
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+if ADMIN_ID == 0:
+    raise ValueError("ADMIN_ID must be set in .env file")
 
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: Dict[str, Any],
-    ) -> Any:
-        user = data.get("event_from_user")
-        if user is not None:
-            now = time.monotonic()
-            last = self._last_seen.get(user.id, 0.0)
-            if now - last < THROTTLE_INTERVAL:
-                return
-            self._last_seen[user.id] = now
-        return await handler(event, data)
+def get_dynamic_departure_dates(direction):
+    """Динамічний розрахунок дат відправлення"""
+    today = datetime.now()
+    dates = []
+    
+    # Генеруємо дати на 3 місяці вперед
+    for i in range(13):
+        date = today + timedelta(weeks=i)
+        formatted_date = date.strftime("%Y-%m-%d")
+        dates.append(formatted_date)
+    
+    return dates
 
-
-# ------------------------------------------------------------------
-# GOOGLE CALENDAR
-# ------------------------------------------------------------------
+async def init_db():
+    """Ініціалізація БД з aiosqlite"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                direction TEXT,
+                location TEXT,
+                phone TEXT,
+                has_baggage BOOLEAN,
+                baggage_quantity INTEGER,
+                weight REAL,
+                destination TEXT,
+                departure_date TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS status_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER,
+                status TEXT,
+                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (request_id) REFERENCES requests(id)
+            )
+        ''')
+        await db.commit()
 
 def get_google_calendar_service():
-    """Отримуємо авторизований сервіс Google Calendar."""
-    creds = None
-
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'rb') as token:
-            creds = pickle.load(token)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            from google.auth.transport.requests import Request
-            creds.refresh(Request())
-        else:
-            if not os.path.exists(CREDENTIALS_FILE):
-                raise FileNotFoundError(
-                    f"❌ Файл {CREDENTIALS_FILE} не знайдено. "
-                    "Завантажте його з Google Cloud Console."
-                )
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CREDENTIALS_FILE, CALENDAR_SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        with open(TOKEN_FILE, 'wb') as token:
-            pickle.dump(creds, token)
-            logger.info("💾 Токен Google Calendar збережено")
-
-    return build('calendar', 'v3', credentials=creds)
-
-
-def create_calendar_event(title: str, description: str, event_date: str):
-    """Створюємо подію в Google Calendar на дату виїзду."""
+    """Google Calendar сервіс з готовим token.pickle"""
     try:
-        service = get_google_calendar_service()
+        token_path = "token.pickle"
+        
+        if not os.path.exists(token_path):
+            logger.warning(f"Token file not found at {token_path}. Please generate it locally first.")
+            return None
+        
+        credentials = Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS_FILE,
+            scopes=['https://www.googleapis.com/auth/calendar']
+        )
+        return build('calendar', 'v3', credentials=credentials)
+    except Exception as e:
+        logger.error(f"Error initializing Google Calendar service: {e}")
+        return None
 
-        event_start = datetime.fromisoformat(event_date)
-        event_end = event_start + timedelta(hours=2)
+async def check_calendar_availability(departure_date, direction):
+    """Перевірка доступності дати в календарі"""
+    service = get_google_calendar_service()
+    if not service:
+        return True
 
-        event = {
-            'summary': title,
-            'description': description,
-            'start': {
-                'dateTime': event_start.isoformat(),
-                'timeZone': 'Europe/Kiev',
-            },
-            'end': {
-                'dateTime': event_end.isoformat(),
-                'timeZone': 'Europe/Kiev',
-            },
-        }
+    try:
+        start_of_day = f"{departure_date}T00:00:00+02:00"
+        end_of_day = f"{departure_date}T23:59:59+02:00"
 
-        result = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
-        logger.info(f"📅 Подія створена в календарі: {result.get('id')}")
+        events = service.events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=start_of_day,
+            timeMax=end_of_day,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        for event in events.get('items', []):
+            if direction.lower() in event.get('summary', '').lower():
+                available_seats = int(event.get('description', '0') or '0')
+                return available_seats > 0
+
         return True
     except Exception as e:
-        logger.error(f"❌ Помилка при створенні подієї в календарі: {e}")
-        return False
-
-
-async def create_calendar_event_async(title: str, description: str, event_date: str, message):
-    """Асинхронна обгортка для Google Calendar (запускається в фоні)."""
-    created = await asyncio.to_thread(create_calendar_event, title, description, event_date)
-    if created:
-        try:
-            await message.answer("📅 Подія додана в Google Calendar!")
-        except Exception as e:
-            logger.warning(f"⚠️ Не вдалось надіслати повідомлення про календар: {e}")
-
-
-# ------------------------------------------------------------------
-# БАЗА ДАНИХ
-# ------------------------------------------------------------------
-
-def db_connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = db_connect()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            username TEXT,
-            req_type TEXT NOT NULL,
-            direction TEXT,
-            location TEXT,
-            address TEXT,
-            phone TEXT,
-            dimensions TEXT,
-            weight TEXT,
-            destination TEXT,
-            departure_date TEXT,
-            status TEXT DEFAULT 'new',
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_user_id ON requests(user_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON requests(status)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON requests(created_at)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_user_created ON requests(user_id, created_at)")
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS status_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            request_id INTEGER NOT NULL,
-            old_status TEXT,
-            new_status TEXT,
-            changed_by TEXT,
-            changed_at TEXT NOT NULL,
-            FOREIGN KEY(request_id) REFERENCES requests(id)
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_request_id ON status_log(request_id)")
-
-    conn.commit()
-    conn.close()
-    logger.info("✅ База даних ініціалізована")
-
-
-def save_request(data: dict) -> int:
-    conn = db_connect()
-    cur = conn.execute(
-        """
-        INSERT INTO requests
-            (user_id, username, req_type, direction, location, address, phone,
-             dimensions, weight, destination, departure_date, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
-        """,
-        (
-            data.get("user_id"),
-            data.get("username"),
-            data.get("req_type"),
-            data.get("direction"),
-            data.get("location"),
-            data.get("address"),
-            data.get("phone"),
-            data.get("dimensions"),
-            data.get("weight"),
-            data.get("destination"),
-            data.get("departure_date"),
-            datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
-    conn.commit()
-    req_id = cur.lastrowid
-    conn.close()
-    return req_id
-
-
-def save_not_found_request(data: dict) -> int:
-    conn = db_connect()
-    cur = conn.execute(
-        """
-        INSERT INTO requests
-            (user_id, username, req_type, direction, location, phone, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'new', ?)
-        """,
-        (
-            data.get("user_id"),
-            data.get("username"),
-            data.get("req_type"),
-            data.get("direction"),
-            data.get("location"),
-            data.get("phone"),
-            datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
-    conn.commit()
-    req_id = cur.lastrowid
-    conn.close()
-    return req_id
-
-
-def get_user_requests(user_id: int):
-    conn = db_connect()
-    rows = conn.execute(
-        "SELECT * FROM requests WHERE user_id = ? ORDER BY id DESC LIMIT 10",
-        (user_id,),
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def get_request(req_id: int):
-    conn = db_connect()
-    row = conn.execute("SELECT * FROM requests WHERE id = ?", (req_id,)).fetchone()
-    conn.close()
-    return row
-
-
-def set_status(req_id: int, status: str, changed_by: str = "admin"):
-    try:
-        conn = db_connect()
-        old_req = conn.execute("SELECT status FROM requests WHERE id = ?", (req_id,)).fetchone()
-        old_status = old_req["status"] if old_req else None
-
-        conn.execute("UPDATE requests SET status = ? WHERE id = ?", (status, req_id))
-
-        conn.execute(
-            """
-            INSERT INTO status_log (request_id, old_status, new_status, changed_by, changed_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (req_id, old_status, status, changed_by, datetime.now().isoformat(timespec="seconds"))
-        )
-        conn.commit()
-        conn.close()
-        logger.info(f"📝 Заявка #{req_id}: статус змінено {old_status} → {status}")
-    except Exception as e:
-        logger.error(f"❌ Помилка при оновленні статусу заявки #{req_id}: {e}")
-        raise
-
-
-# ------------------------------------------------------------------
-# СТАНИ (FSM)
-# ------------------------------------------------------------------
+        logger.error(f"Error checking calendar availability: {e}")
+        return True
 
 class RequestForm(StatesGroup):
-    # Загальні
     direction = State()
-
-    # Пасажирські
     postal_code = State()
     city = State()
     street = State()
@@ -325,895 +140,534 @@ class RequestForm(StatesGroup):
     weight = State()
     destination = State()
     departure_date = State()
-
-    # Посилки
-    parcel_country_choice = State()  # Вибір країни для посилок
-    parcel_city_choice = State()
+    parcel_country = State()
+    parcel_city = State()
     parcel_phone = State()
-
-    # Посилки Німеччина
-    parcel_de_postal_code = State()
-    parcel_de_city = State()
-    parcel_de_street = State()
-    parcel_de_house_number = State()
-    parcel_de_quantity = State()
-    parcel_de_weight = State()
-
-    # "Не має міста"
+    parcel_from_city = State()
+    parcel_from_country = State()
+    parcel_weight = State()
+    parcel_description = State()
     not_found_city = State()
     not_found_phone = State()
 
-
-# ------------------------------------------------------------------
-# КЛАВІАТУРИ
-# ------------------------------------------------------------------
-
-def type_choice_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
+def main_keyboard():
+    keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🚖 Пасажирські перевезення")],
-            [KeyboardButton(text="📦 Посилка")],
-            [KeyboardButton(text="📋 Мої заявки")],
+            [KeyboardButton(text="🚌 Пасажир"), KeyboardButton(text="📦 Посилка")],
+            [KeyboardButton(text="ℹ️ Про нас"), KeyboardButton(text="📞 Контакти")]
         ],
-        resize_keyboard=True,
+        resize_keyboard=True
     )
+    return keyboard
 
-
-def phone_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Надіслати мій номер", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-
-
-def cancel_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Скасувати")]],
-        resize_keyboard=True,
-    )
-
-
-def baggage_choice_kb() -> ReplyKeyboardMarkup:
-    """Вибір чи буде багаж"""
-    return ReplyKeyboardMarkup(
+def direction_keyboard():
+    keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="✅ Так, буде багаж")],
-            [KeyboardButton(text="❌ Ні, без багажу")],
+            [KeyboardButton(text="🇺🇦 Україна → 🇩🇪 Німеччина")],
+            [KeyboardButton(text="🇩🇪 Німеччина → 🇺🇦 Україна")],
+            [KeyboardButton(text="🔙 Назад")]
         ],
-        resize_keyboard=True,
+        resize_keyboard=True
     )
+    return keyboard
 
-
-def parcel_city_kb() -> InlineKeyboardMarkup:
-    """Вибір міста для посилок"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🏙️ Івано-Франківськ", callback_data="parcel_city:if")],
-            [InlineKeyboardButton(text="📍 Інші міста", callback_data="parcel_city:other")],
-        ]
-    )
-
-
-def parcel_country_kb() -> InlineKeyboardMarkup:
-    """Вибір країни для посилок"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🇺🇦 Україна", callback_data="parcel_country:ukraine")],
-            [InlineKeyboardButton(text="🇩🇪 Німеччина", callback_data="parcel_country:germany")],
-        ]
-    )
-
-
-def admin_status_kb(req_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Прийнято в роботу", callback_data=f"st:{req_id}:in_progress"),
-                InlineKeyboardButton(text="🏁 Виконано", callback_data=f"st:{req_id}:done"),
-            ]
-        ]
-    )
-
-
-def direction_choice_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
+def yes_no_keyboard():
+    keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🇺🇦 Україна → Німеччина")],
-            [KeyboardButton(text="🇩🇪 Німеччина → Україна")],
+            [KeyboardButton(text="Так"), KeyboardButton(text="Ні")],
+            [KeyboardButton(text="🔙 Назад")]
         ],
-        resize_keyboard=True,
+        resize_keyboard=True
     )
+    return keyboard
 
+def get_destinations(direction):
+    if direction == "ukraine":
+        return ["Київ", "Львів", "Харків", "Одеса", "Інше"]
+    else:
+        return ["Берлін", "Мюнхен", "Кельн", "Гамбург", "Інше"]
 
-def ukraine_cities_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🏙️ Львів", callback_data="city:lviv")],
-            [InlineKeyboardButton(text="🏙️ Івано-Франківськ", callback_data="city:ivano_frankivsk")],
-            [InlineKeyboardButton(text="🏘️ Львівська область", callback_data="city:lviv_region")],
-            [InlineKeyboardButton(text="🏘️ Івано-Франківська область", callback_data="city:ivano_frankivsk_region")],
-            [InlineKeyboardButton(text="❌ Не має вашого міста", callback_data="city:not_found")],
-        ]
+def destinations_keyboard(direction):
+    destinations = get_destinations(direction)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=dest)] for dest in destinations],
+        resize_keyboard=True
     )
+    return keyboard
 
+def departure_dates_keyboard(direction):
+    dates = get_dynamic_departure_dates(direction)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=date)] for date in dates[:8]],
+        resize_keyboard=True
+    )
+    return keyboard
 
-def get_available_dates(country: str) -> list:
-    today = date.today()
-    all_dates = FIXED_DEPARTURE_DATES.get(country, [])
-    return [d for d in all_dates if d >= today]
+def parcel_countries_keyboard():
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🇺🇦 Україна")],
+            [KeyboardButton(text="🇩🇪 Німеччина")],
+            [KeyboardButton(text="🔙 Назад")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
 
-
-def date_choice_kb(direction: str) -> InlineKeyboardMarkup:
-    buttons = []
-    row = []
-    for d in get_available_dates(direction):
-        label = d.strftime("%d.%m.%Y")
-        row.append(InlineKeyboardButton(text=label, callback_data=f"date:{d.isoformat()}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-# ------------------------------------------------------------------
-# ЗАГАЛЬНІ КОМАНДИ
-# ------------------------------------------------------------------
-
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    logger.info(f"👤 Користувач {message.from_user.id} (@{message.from_user.username}) розпочав бота")
+@router.message(F.text == "🚌 Пасажир")
+async def passenger_start(message: types.Message, state: FSMContext):
     await message.answer(
-        f"Вас вітає <b>{COMPANY_NAME}</b>! 🚐\n\n"
-        "Оберіть, будь ласка, потрібну послугу нижче 👇",
-        reply_markup=type_choice_kb(),
-        parse_mode="HTML",
+        "🚌 Обереть напрямок подорожі:",
+        reply_markup=direction_keyboard()
     )
+    await state.set_state(RequestForm.direction)
 
-
-@router.message(Command("cancel"))
-@router.message(F.text == "❌ Скасувати")
-async def cmd_cancel(message: Message, state: FSMContext):
-    await state.clear()
-    logger.info(f"⛔ Користувач {message.from_user.id} скасував заявку")
-    await message.answer("Заявку скасовано. Повертаю до головного меню.", reply_markup=type_choice_kb())
-
-
-@router.message(Command("all"))
-async def cmd_all_requests(message: Message):
-    user_id = message.from_user.id
-    if user_id not in ADMIN_CHAT_IDS:
-        await message.answer("❌ У вас немає доступу до цієї команди.")
-        logger.warning(f"⚠️ Користувач {user_id} спробував використати /all без дозволу")
-        return
-
-    try:
-        conn = db_connect()
-        rows = conn.execute(
-            "SELECT * FROM requests ORDER BY created_at DESC LIMIT 50"
-        ).fetchall()
-        conn.close()
-
-        if not rows:
-            await message.answer("📭 Заявок немає.")
-            return
-
-        status_labels = {"new": "🆕 нова", "in_progress": "⏳ в роботі", "done": "✅ виконано"}
-        lines = [f"<b>Останні 50 заявок:</b>\n"]
-
-        for r in rows:
-            kind = "🚖 Пасажири" if r["req_type"] == "passenger" else "📦 Посилка"
-            lines.append(
-                f"#{r['id']} — {kind} | @{r['username'] or r['user_id']}\n"
-                f"  {r['location'] or 'N/A'}, {r['address'] or 'N/A'} → {r['destination']}\n"
-                f"  Статус: {status_labels.get(r['status'], r['status'])} | {r['created_at']}\n"
-            )
-
-        await message.answer("\n".join(lines), parse_mode="HTML")
-        logger.info(f"📊 Адмін {user_id} переглянув всі заявки")
-    except Exception as e:
-        logger.error(f"❌ Помилка при отриманні заявок: {e}")
-        await message.answer("❌ Помилка при отриманні даних.")
-
-
-@router.message(F.text == "📋 Мої заявки")
-async def my_requests(message: Message):
-    rows = get_user_requests(message.from_user.id)
-    if not rows:
-        await message.answer("У вас поки немає заявок.")
-        return
-    status_labels = {"new": "🆕 нова", "in_progress": "⏳ в роботі", "done": "✅ виконано"}
-    lines = []
-    for r in rows:
-        kind = "🚖 Пасажири" if r["req_type"] == "passenger" else "📦 Посилка"
-        lines.append(
-            f"#{r['id']} — {kind}\n"
-            f"{r['location'] or 'N/A'}, {r['address'] or 'N/A'} → {r['destination']}\n"
-            f"Дата: {r['departure_date'] or '—'}\n"
-            f"Статус: {status_labels.get(r['status'], r['status'])}\n"
-        )
-    await message.answer("\n".join(lines))
-
-
-# ------------------------------------------------------------------
-# ФОРМА ПАСАЖИРСЬКИХ ПЕРЕВЕЗЕНЬ
-# ------------------------------------------------------------------
-
-async def is_too_long(message: Message) -> bool:
-    text = message.text or ""
-    if len(text) > MAX_TEXT_LENGTH:
-        await message.answer(
-            f"Текст занадто довгий (макс. {MAX_TEXT_LENGTH} символів). Спробуйте коротше."
-        )
-        return True
-    return False
-
-
-@router.message(F.text.in_({"🚖 Пасажирські перевезення", "📦 Посилка"}))
-async def start_form(message: Message, state: FSMContext):
-    req_type = "passenger" if "Пасажирські" in message.text else "parcel"
-    await state.update_data(req_type=req_type, user_id=message.from_user.id, username=message.from_user.username)
-
-    if req_type == "passenger":
-        # Пасажирські перевезення
-        await state.set_state(RequestForm.direction)
-        await message.answer(
-            "🚗 Обберіть напрямок подорожі:",
-            reply_markup=direction_choice_kb(),
-        )
-    else:
-        # Посилки
-        await state.set_state(RequestForm.parcel_country_choice)
-        await message.answer(
-            "📦 Звідки ви хочете відправити посилку?",
-            reply_markup=parcel_country_kb(),
-        )
-
-
-@router.message(RequestForm.direction)
-async def form_direction(message: Message, state: FSMContext):
-    if "Україна" in message.text:
-        direction = "ukraine"
-    elif "Німеччина" in message.text:
-        direction = "germany"
-    else:
-        await message.answer("❌ Обберіть з кнопок!")
-        return
-
+@router.message(RequestForm.direction, F.text.in_(["🇺🇦 Україна → 🇩🇪 Німеччина", "🇩🇪 Німеччина → 🇺🇦 Україна"]))
+async def form_direction(message: types.Message, state: FSMContext):
+    direction = "ukraine" if "Україна" in message.text and "Німеччина" in message.text else "germany"
     await state.update_data(direction=direction)
-    await state.set_state(RequestForm.postal_code)
     await message.answer(
-        "📮 Введіть поштовий код:",
-        reply_markup=cancel_kb(),
+        "✉️ Введіть поштовий код:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
     )
-
+    await state.set_state(RequestForm.postal_code)
 
 @router.message(RequestForm.postal_code)
-async def form_postal_code(message: Message, state: FSMContext):
-    if await is_too_long(message):
+async def form_postal_code(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("🚌 Обереть напрямок подорожі:", reply_markup=direction_keyboard())
+        await state.set_state(RequestForm.direction)
         return
 
     await state.update_data(location=message.text)
-    await state.set_state(RequestForm.city)
-    await message.answer(
-        "🏙️ Введіть місто/село:",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(RequestForm.city)
-async def form_city(message: Message, state: FSMContext):
-    if await is_too_long(message):
-        return
-
-    data = await state.get_data()
-    postal_code = data.get("location", "")
-    await state.update_data(location=f"{postal_code} {message.text}")
-    await state.set_state(RequestForm.street)
-    await message.answer(
-        "🛣️ Введіть вулицю:",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(RequestForm.street)
-async def form_street(message: Message, state: FSMContext):
-    if await is_too_long(message):
-        return
-
-    data = await state.get_data()
-    current_location = data.get("location", "")
-    await state.update_data(location=f"{current_location}, {message.text}")
-    await state.set_state(RequestForm.house_number)
-    await message.answer(
-        "🏠 Введіть номер будинку:",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(RequestForm.house_number)
-async def form_house_number(message: Message, state: FSMContext):
-    if await is_too_long(message):
-        return
-
-    data = await state.get_data()
-    current_location = data.get("location", "")
-    await state.update_data(location=f"{current_location} {message.text}")
-    await state.set_state(RequestForm.phone)
-    await message.answer(
-        "📱 Контактний номер телефону?",
-        reply_markup=phone_kb(),
-    )
-
-
-@router.callback_query(RequestForm.parcel_country_choice, F.data.startswith("parcel_country:"))
-async def form_parcel_country_choice(callback: CallbackQuery, state: FSMContext):
-    """Обробка вибору країни для посилок"""
-    country_choice = callback.data.split(":", 1)[1]
-
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer()
-
-    if country_choice == "ukraine":
-        # Україна
-        await state.update_data(direction="ukraine")
-        await state.set_state(RequestForm.parcel_city_choice)
-        await callback.message.answer(
-            "🏙️ Звідки ви хочете відправити посилку?",
-            reply_markup=parcel_city_kb(),
-        )
-    else:
-        # Німеччина
-        await state.update_data(direction="germany")
-        await state.set_state(RequestForm.parcel_de_postal_code)
-        await callback.message.answer(
-            "📮 Введіть поштовий код (PLZ):",
-            reply_markup=cancel_kb(),
-        )
-
-
-@router.callback_query(RequestForm.parcel_city_choice, F.data.startswith("parcel_city:"))
-async def form_parcel_city_choice(callback: CallbackQuery, state: FSMContext):
-    """Обробка вибору міста для посилок"""
-    city_choice = callback.data.split(":", 1)[1]
-
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer()
-
-    if city_choice == "if":
-        # Івано-Франківськ
-        await state.update_data(location="Івано-Франківськ")
-        await state.set_state(RequestForm.parcel_phone)
-        await callback.message.answer(
-            "📱 Ваш номер телефону?",
-            reply_markup=phone_kb(),
-        )
-    else:
-        # Інші міста
-        info_text = (
-            "📍 <b>Інші міста</b>\n\n"
-            "<i>Всі передачі з України відправляються на адресу Нової Пошти, потім доставляються в Німеччину.</i>\n\n"
-            "<b>Адреса Нової Пошти:</b>\n"
-            "м. Івано-Франківськ, НП#1\n"
-            "Шишкін Павло\n"
-            "☎️ 0972107800\n\n"
-            "<b>Інструкції з пакування:</b>\n"
-            "✅ ОБОВ'ЯЗКОВО всі посилки пакуються в сумки або чемодани\n"
-            "✅ ОБОВ'ЯЗКОВО в посилці має бути листочок з точним адресом і номером телефону отримувача\n\n"
-            "<b>Заборонені речи в передачах:</b>\n"
-            "❌ Сигарети\n"
-            "❌ Алкоголь\n"
-            "❌ Мясне\n"
-            "❌ Лікарство (в обмеженій кількості, по 1-2 біостера кожного виду лікарства)"
-        )
-        await callback.message.answer(info_text, parse_mode="HTML")
-
-        # Завершуємо заявку для "Інші міста"
-        await state.update_data(location="Інші міста")
-        data = await state.get_data()
-        req_id = save_request(data)
-        await state.clear()
-
-        await callback.message.answer(
-            f"✅ Дякуємо!\n\n"
-            f"Вашу заявку №{req_id} прийнято. "
-            f"Команда GlobexTrans звʼяжеться з вами найближчим часом.",
-            reply_markup=type_choice_kb(),
-        )
-        logger.info(f"📦 Заявка посилки від іншого міста від користувача {callback.from_user.id}: #{req_id}")
-
-        # Повідомляємо адмінів
-        kind = "📦 Посилка"
-        text = (
-            f"<b>Нова заявка</b> №{req_id} — {kind}\n\n"
-            f"Місто: Інші міста\n"
-            f"Користувач: @{callback.from_user.username or callback.from_user.id}"
-        )
-        await notify_admins(callback.bot, text, req_id)
-
-
-@router.message(RequestForm.parcel_phone, F.contact)
-async def form_parcel_phone_contact(message: Message, state: FSMContext, bot: Bot):
-    """Обробка телефону для посилок (Івано-Франківськ)"""
-    await state.update_data(phone=message.contact.phone_number)
-    data = await state.get_data()
-    req_id = save_request(data)
-    await state.clear()
-
-    await message.answer(
-        f"✅ Дякуємо!\n\n"
-        f"Вашу заявку №{req_id} прийнято. "
-        f"Команда GlobexTrans звʼяжеться з вами найближчим часом.",
-        reply_markup=type_choice_kb(),
-    )
-    logger.info(f"📦 Заявка посилки від користувача {message.from_user.id}: #{req_id}")
-
-    # Повідомляємо адмінів
-    kind = "📦 Посилка"
-    text = (
-        f"<b>Нова заявка</b> №{req_id} — {kind}\n\n"
-        f"Місто: {data.get('location')}\n"
-        f"Телефон: {data.get('phone')}\n"
-        f"Користувач: @{message.from_user.username or message.from_user.id}"
-    )
-    await notify_admins(bot, text, req_id)
-
-
-@router.message(RequestForm.parcel_phone)
-async def form_parcel_phone_text(message: Message, state: FSMContext, bot: Bot):
-    """Текстовий вввід телефону для посилок"""
-    if await is_too_long(message):
-        return
-
-    await state.update_data(phone=message.text)
-    data = await state.get_data()
-    req_id = save_request(data)
-    await state.clear()
-
-    await message.answer(
-        f"✅ Дякуємо!\n\n"
-        f"Вашу заявку №{req_id} прийнято. "
-        f"Команда GlobexTrans звʼяжеться з вами найближчим часом.",
-        reply_markup=type_choice_kb(),
-    )
-    logger.info(f"📦 Заявка посилки від користувача {message.from_user.id}: #{req_id}")
-
-    # Повідомляємо адмінів
-    kind = "📦 Посилка"
-    text = (
-        f"<b>Нова заявка</b> №{req_id} — {kind}\n\n"
-        f"Місто: {data.get('location')}\n"
-        f"Телефон: {data.get('phone')}\n"
-        f"Користувач: @{message.from_user.username or message.from_user.id}"
-    )
-    await notify_admins(bot, text, req_id)
-
-
-# ------------------------------------------------------------------
-# ПОСИЛКИ З НІМЕЧЧИНИ
-# ------------------------------------------------------------------
-
-@router.message(RequestForm.parcel_de_postal_code)
-async def form_parcel_de_postal_code(message: Message, state: FSMContext):
-    """Поштовий код для Німеччини"""
-    if await is_too_long(message):
-        return
-
-    await state.update_data(location=message.text)
-    await state.set_state(RequestForm.parcel_de_city)
     await message.answer(
         "🏙️ Введіть місто:",
-        reply_markup=cancel_kb(),
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
     )
+    await state.set_state(RequestForm.city)
 
-
-@router.message(RequestForm.parcel_de_city)
-async def form_parcel_de_city(message: Message, state: FSMContext):
-    """Місто для Німеччини"""
-    if await is_too_long(message):
+@router.message(RequestForm.city)
+async def form_city(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("✉️ Введіть поштовий код:")
+        await state.set_state(RequestForm.postal_code)
         return
 
     data = await state.get_data()
-    postal_code = data.get("location", "")
-    await state.update_data(address=f"{postal_code} {message.text}")
-    await state.set_state(RequestForm.parcel_de_street)
+    location = f"{data['location']} {message.text},"
+    await state.update_data(location=location)
     await message.answer(
         "🛣️ Введіть вулицю:",
-        reply_markup=cancel_kb(),
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
     )
+    await state.set_state(RequestForm.street)
 
-
-@router.message(RequestForm.parcel_de_street)
-async def form_parcel_de_street(message: Message, state: FSMContext):
-    """Вулиця для Німеччини"""
-    if await is_too_long(message):
+@router.message(RequestForm.street)
+async def form_street(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("🏙️ Введіть місто:")
+        await state.set_state(RequestForm.city)
         return
 
     data = await state.get_data()
-    current_address = data.get("address", "")
-    await state.update_data(address=f"{current_address}, {message.text}")
-    await state.set_state(RequestForm.parcel_de_house_number)
+    location = f"{data['location']} {message.text}"
+    await state.update_data(location=location)
     await message.answer(
         "🏠 Введіть номер будинку:",
-        reply_markup=cancel_kb(),
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
     )
+    await state.set_state(RequestForm.house_number)
 
-
-@router.message(RequestForm.parcel_de_house_number)
-async def form_parcel_de_house_number(message: Message, state: FSMContext):
-    """Номер будинку для Німеччини"""
-    if await is_too_long(message):
+@router.message(RequestForm.house_number)
+async def form_house_number(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("🛣️ Введіть вулицю:")
+        await state.set_state(RequestForm.street)
         return
 
     data = await state.get_data()
-    current_address = data.get("address", "")
-    await state.update_data(address=f"{current_address} {message.text}")
-    await state.set_state(RequestForm.parcel_de_quantity)
+    location = f"{data['location']} {message.text}"
+    await state.update_data(location=location)
     await message.answer(
-        "📦 Кількість посилок:",
-        reply_markup=cancel_kb(),
+        "📞 Введіть номер телефону:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
     )
-
-
-@router.message(RequestForm.parcel_de_quantity)
-async def form_parcel_de_quantity(message: Message, state: FSMContext):
-    """Кількість посилок"""
-    if await is_too_long(message):
-        return
-
-    await state.update_data(dimensions=message.text)
-    await state.set_state(RequestForm.parcel_de_weight)
-    await message.answer(
-        "⚖️ Орієнтовна вага (кг):",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(RequestForm.parcel_de_weight)
-async def form_parcel_de_weight(message: Message, state: FSMContext, bot: Bot):
-    """Вага для Німеччини - завершення форми"""
-    if await is_too_long(message):
-        return
-
-    await state.update_data(weight=message.text)
-    data = await state.get_data()
-    req_id = save_request(data)
-    await state.clear()
-
-    await message.answer(
-        f"✅ Дякуємо!\n\n"
-        f"Вашу заявку №{req_id} прийнято. "
-        f"Очікуйте, команда GlobexTrans звʼяжеться з вами найближчим часом.",
-        reply_markup=type_choice_kb(),
-    )
-    logger.info(f"📦 Заявка посилки з Німеччини від користувача {message.from_user.id}: #{req_id}")
-
-    # Повідомляємо адмінів
-    kind = "📦 Посилка (Німеччина)"
-    text = (
-        f"<b>Нова заявка</b> №{req_id} — {kind}\n\n"
-        f"Адреса: {data.get('address')}\n"
-        f"Кількість посилок: {data.get('dimensions')}\n"
-        f"Вага: {data.get('weight')} кг\n"
-        f"Користувач: @{message.from_user.username or message.from_user.id}"
-    )
-    await notify_admins(bot, text, req_id)
-
-
-async def form_custom_city(message: Message, state: FSMContext):
-    if await is_too_long(message):
-        return
-
-    custom_city = message.text
-    data = await state.get_data()
-    region = data.get("location", "")
-
-    full_location = f"{custom_city}, {region}"
-    await state.update_data(location=full_location)
-
-    await state.set_state(RequestForm.address)
-    await message.answer(
-        "🏠 Введіть адресу (вулиця, номер дому):",
-        reply_markup=cancel_kb(),
-    )
-
-
-@router.message(RequestForm.address)
-async def form_address(message: Message, state: FSMContext):
-    if await is_too_long(message):
-        return
-
-    await state.update_data(address=message.text)
     await state.set_state(RequestForm.phone)
-    await message.answer(
-        "📱 Контактний номер телефону?",
-        reply_markup=phone_kb(),
-    )
-
-
-@router.message(RequestForm.phone, F.contact)
-async def form_phone_contact(message: Message, state: FSMContext):
-    await state.update_data(phone=message.contact.phone_number)
-    await state.set_state(RequestForm.has_baggage)
-    await message.answer(
-        "🎒 Чи у вас буде багаж?",
-        reply_markup=baggage_choice_kb(),
-    )
-
 
 @router.message(RequestForm.phone)
-async def form_phone_text(message: Message, state: FSMContext):
-    if await is_too_long(message):
+async def form_phone(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("🏠 Введіть номер будинку:")
+        await state.set_state(RequestForm.house_number)
         return
+
     await state.update_data(phone=message.text)
-    await state.set_state(RequestForm.has_baggage)
     await message.answer(
-        "🎒 Чи у вас буде багаж?",
-        reply_markup=baggage_choice_kb(),
+        "🎒 Чи буде багаж?",
+        reply_markup=yes_no_keyboard()
     )
+    await state.set_state(RequestForm.has_baggage)
 
+@router.message(RequestForm.has_baggage, F.text.in_(["Так", "Ні"]))
+async def form_has_baggage(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("📞 Введіть номер телефону:")
+        await state.set_state(RequestForm.phone)
+        return
 
-@router.message(RequestForm.has_baggage)
-async def form_has_baggage(message: Message, state: FSMContext):
-    if "Так" in message.text or "так" in message.text:
-        # Буде багаж — запитуємо кількість
-        await state.update_data(has_baggage=True)
+    has_baggage = message.text == "Так"
+    await state.update_data(has_baggage=has_baggage)
+
+    if has_baggage:
+        await message.answer(
+            "🎒 Введіть кількість багажу:",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="🔙 Назад")]],
+                resize_keyboard=True
+            )
+        )
         await state.set_state(RequestForm.baggage_quantity)
-        await message.answer(
-            "🛄 Скільки вас буде з багажем? (кількість осіб/багажних одиниць):",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-    elif "Ні" in message.text or "ні" in message.text or "без" in message.text:
-        # Без багажу — пропускаємо на destination
-        await state.update_data(has_baggage=False, dimensions=None, weight=None)
-        await state.set_state(RequestForm.destination)
-        await message.answer(
-            "🎯 Куди їдете? (місто/адреса):",
-            reply_markup=ReplyKeyboardRemove(),
-        )
     else:
-        await message.answer("❌ Обберіть з кнопок!")
-
+        await state.update_data(baggage_quantity=0, weight=0)
+        await message.answer(
+            "🎯 Куди їдете?",
+            reply_markup=destinations_keyboard(
+                (await state.get_data())['direction']
+            )
+        )
+        await state.set_state(RequestForm.destination)
 
 @router.message(RequestForm.baggage_quantity)
-async def form_baggage_quantity(message: Message, state: FSMContext):
-    if await is_too_long(message):
+async def form_baggage_quantity(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("🎒 Чи буде багаж?", reply_markup=yes_no_keyboard())
+        await state.set_state(RequestForm.has_baggage)
         return
-    await state.update_data(dimensions=message.text)
-    await state.set_state(RequestForm.weight)
-    await message.answer("⚖️ Орієнтовна вага (кг)?")
 
+    try:
+        quantity = int(message.text)
+        await state.update_data(baggage_quantity=quantity)
+        await message.answer(
+            "⚖️ Введіть вагу (в кг):",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="🔙 Назад")]],
+                resize_keyboard=True
+            )
+        )
+        await state.set_state(RequestForm.weight)
+    except ValueError:
+        await message.answer("❌ Будь ласка, введіть числове значення:")
 
 @router.message(RequestForm.weight)
-async def form_weight(message: Message, state: FSMContext):
-    if await is_too_long(message):
+async def form_weight(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("🎒 Введіть кількість багажу:")
+        await state.set_state(RequestForm.baggage_quantity)
         return
-    await state.update_data(weight=message.text)
-    await state.set_state(RequestForm.destination)
-    await message.answer("🎯 Куди їдете? (місто/адреса):")
 
+    try:
+        weight = float(message.text)
+        await state.update_data(weight=weight)
+        await message.answer(
+            "🎯 Куди їдете?",
+            reply_markup=destinations_keyboard(
+                (await state.get_data())['direction']
+            )
+        )
+        await state.set_state(RequestForm.destination)
+    except ValueError:
+        await message.answer("❌ Будь ласка, введіть числове значення:")
 
 @router.message(RequestForm.destination)
-async def form_destination(message: Message, state: FSMContext):
-    if await is_too_long(message):
+async def form_destination(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        data = await state.get_data()
+        if data.get('has_baggage'):
+            await message.answer("⚖️ Введіть вагу (в кг):")
+            await state.set_state(RequestForm.weight)
+        else:
+            await message.answer("🎒 Чи буде багаж?", reply_markup=yes_no_keyboard())
+            await state.set_state(RequestForm.has_baggage)
         return
+
     await state.update_data(destination=message.text)
+    direction = (await state.get_data())['direction']
+    await message.answer(
+        "📅 Обереть дату відправлення:",
+        reply_markup=departure_dates_keyboard(direction)
+    )
     await state.set_state(RequestForm.departure_date)
 
-    data = await state.get_data()
-    direction = data.get("direction", "ukraine")
+@router.message(RequestForm.departure_date)
+async def form_departure_date(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("🎯 Куди їдете?", reply_markup=destinations_keyboard(
+            (await state.get_data())['direction']
+        ))
+        await state.set_state(RequestForm.destination)
+        return
 
+    await state.update_data(departure_date=message.text)
+    await finalize_request(message, state)
+
+@router.message(F.text == "📦 Посилка")
+async def parcel_start(message: types.Message, state: FSMContext):
     await message.answer(
-        "📅 Оберіть дату виїзду:",
-        reply_markup=date_choice_kb(direction),
+        "📦 З якої країни відправляємо посилку?",
+        reply_markup=parcel_countries_keyboard()
     )
+    await state.set_state(RequestForm.parcel_country)
 
+@router.message(RequestForm.parcel_country, F.text.in_(["🇺🇦 Україна", "🇩🇪 Німеччина"]))
+async def parcel_country_selected(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("Головне меню:", reply_markup=main_keyboard())
+        await state.clear()
+        return
 
-@router.callback_query(RequestForm.departure_date, F.data.startswith("date:"))
-async def form_departure_date(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    chosen_date = callback.data.split(":", 1)[1]
-    await state.update_data(departure_date=chosen_date)
-    data = await state.get_data()
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer()
-    await finalize_request(
-        chat_id=callback.from_user.id,
-        username=callback.from_user.username,
-        bot=bot,
-        state=state,
-        data=data,
-    )
+    country = "ukraine" if "Україна" in message.text else "germany"
+    await state.update_data(parcel_country=country)
 
+    if country == "ukraine":
+        await message.answer(
+            "🏙️ Введіть місто відправлення (Україна):",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="🔙 Назад")]],
+                resize_keyboard=True
+            )
+        )
+        await state.set_state(RequestForm.parcel_city)
+    else:
+        await message.answer(
+            "🏙️ Введіть місто відправлення (Німеччина):",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="🔙 Назад")]],
+                resize_keyboard=True
+            )
+        )
+        await state.set_state(RequestForm.parcel_from_city)
 
-# ------------------------------------------------------------------
-# ФОРМА "НЕ ЗНАЙШЛИ МІСТА"
-# ------------------------------------------------------------------
-
-@router.message(RequestForm.not_found_city)
-async def form_not_found_city(message: Message, state: FSMContext):
-    if await is_too_long(message):
+@router.message(RequestForm.parcel_city)
+async def parcel_city_input(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("📦 З якої країни відправляємо посилку?", reply_markup=parcel_countries_keyboard())
+        await state.set_state(RequestForm.parcel_country)
         return
 
     await state.update_data(location=message.text)
-    await state.set_state(RequestForm.not_found_phone)
     await message.answer(
-        "📱 Ваш номер телефону:",
-        reply_markup=phone_kb(),
+        "🎯 Введіть місто призначення (Німеччина):",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
     )
+    await state.set_state(RequestForm.destination)
 
+@router.message(RequestForm.destination)
+async def parcel_destination_input(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        data = await state.get_data()
+        if data.get('parcel_city'):
+            await message.answer("🏙️ Введіть місто відправлення (Україна):")
+            await state.set_state(RequestForm.parcel_city)
+        elif data.get('parcel_from_city'):
+            await message.answer("🏙️ Введіть місто відправлення (Німеччина):")
+            await state.set_state(RequestForm.parcel_from_city)
+        return
 
-@router.message(RequestForm.not_found_phone, F.contact)
-async def form_not_found_phone_contact(message: Message, state: FSMContext):
-    await state.update_data(phone=message.contact.phone_number)
-    data = await state.get_data()
-
-    save_not_found_request(data)
-
-    await state.clear()
+    await state.update_data(destination=message.text)
     await message.answer(
-        "✅ Спасибі!\n\n"
-        "Команда GlobexTrans звяжеться з вами найближчим часом "
-        "для уточнення можливості поїздки.",
-        reply_markup=type_choice_kb(),
+        "📞 Введіть номер телефону:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
     )
-    logger.info(f"📝 Заявка 'не має міста' від користувача {message.from_user.id}: {data.get('location')}")
+    await state.set_state(RequestForm.parcel_phone)
 
-
-@router.message(RequestForm.not_found_phone)
-async def form_not_found_phone_text(message: Message, state: FSMContext):
-    if await is_too_long(message):
+@router.message(RequestForm.parcel_phone)
+async def parcel_phone_input(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("🎯 Введіть місто призначення:")
+        await state.set_state(RequestForm.destination)
         return
 
     await state.update_data(phone=message.text)
-    data = await state.get_data()
-
-    save_not_found_request(data)
-
-    await state.clear()
     await message.answer(
-        "✅ Спасибі!\n\n"
-        "Команда GlobexTrans звяжеться з вами найближчим часом "
-        "для уточнення можливості поїздки.",
-        reply_markup=type_choice_kb(),
+        "⚖️ Введіть вагу посилки (в кг):",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
     )
-    logger.info(f"📝 Заявка 'не має міста' від користувача {message.from_user.id}: {data.get('location')}")
+    await state.set_state(RequestForm.parcel_weight)
 
-
-# ------------------------------------------------------------------
-# ФІНАЛІЗАЦІЯ ЗАЯВКИ
-# ------------------------------------------------------------------
-
-async def finalize_request(chat_id: int, username: str, bot: Bot, state: FSMContext, data: dict):
-    req_id = save_request(data)
-    await state.clear()
-    await bot.send_message(
-        chat_id,
-        f"✅ Дякуємо, що скористались нашим сервісом, {COMPANY_NAME}!\n"
-        f"Вашу заявку №{req_id} прийнято. Наш менеджер звʼяжеться з вами найближчим часом.",
-        reply_markup=type_choice_kb(),
-    )
-
-    kind = "🚖 Пасажирські перевезення" if data.get("req_type") == "passenger" else "📦 Посилка"
-    direction_label = "🇺🇦 Україна → Німеччина" if data.get("direction") == "ukraine" else "🇩🇪 Німеччина → Україна"
-
-    text = (
-        f"<b>Нова заявка</b> №{req_id} — {kind}\n\n"
-        f"Напрямок: {direction_label}\n"
-        f"Місто/село: {data.get('location')}\n"
-        f"Адреса: {data.get('address')}\n"
-        f"Телефон: {data.get('phone')}\n"
-        f"Розміри: {data.get('dimensions')}\n"
-        f"Вага: {data.get('weight')} кг\n"
-        f"Пункт призначення: {data.get('destination')}\n"
-        f"Дата виїзду: {data.get('departure_date')}\n"
-        f"Користувач: @{username or chat_id}"
-    )
-    await notify_admins(bot, text, req_id)
-
-
-# ------------------------------------------------------------------
-# СПОВІЩЕННЯ АДМІНІВ + ОБРОБКА СТАТУСІВ
-# ------------------------------------------------------------------
-
-async def notify_admins(bot: Bot, text: str, req_id: int):
-    if not ADMIN_CHAT_IDS or ADMIN_CHAT_IDS == [0]:
-        logger.warning(f"⚠️ ADMIN_CHAT_IDS не налаштовано — заявка #{req_id} збережена, але сповіщення не надіслано.")
+@router.message(RequestForm.parcel_weight)
+async def parcel_weight_input(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("📞 Введіть номер телефону:")
+        await state.set_state(RequestForm.parcel_phone)
         return
 
-    for chat_id in ADMIN_CHAT_IDS:
-        try:
-            logger.info(f"📬 Надсилаємо заявку #{req_id} адміну {chat_id}")
-            await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=admin_status_kb(req_id))
-        except Exception as e:
-            logger.error(f"❌ Не вдалось надіслати повідомлення адміну {chat_id}: {e}")
-
-
-@router.callback_query(F.data.startswith("st:"))
-async def change_status(callback: CallbackQuery, bot: Bot):
     try:
-        _, req_id, status = callback.data.split(":")
-        req_id = int(req_id)
-        set_status(req_id, status, changed_by=f"admin_{callback.from_user.id}")
-
-        labels = {"in_progress": "⏳ в роботі", "done": "✅ виконано"}
-        status_text = labels.get(status, status)
-
-        await callback.answer(f"✅ Статус заявки №{req_id} оновлено: {status_text}")
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.message.answer(f"📝 Статус заявки №{req_id}: {status_text}")
-
-        req = get_request(req_id)
-        if req is not None:
-            client_texts = {
-                "in_progress": f"⏳ Вашу заявку №{req_id} прийнято в роботу. Менеджер {COMPANY_NAME} може звʼязатись з вами для уточнення деталей.",
-                "done": f"✅ Вашу заявку №{req_id} виконано. Дякуємо, що скористались {COMPANY_NAME}!",
-            }
-            text = client_texts.get(status)
-            if text:
-                try:
-                    await bot.send_message(req["user_id"], text)
-                    logger.info(f"📨 Клієнт {req['user_id']} повідомлений про статус заявки #{req_id}")
-                except Exception as e:
-                    logger.error(f"❌ Не вдалось повідомити клієнта {req['user_id']} про статус заявки №{req_id}: {e}")
-
-            # НОВЕ: Якщо статус "done" — створюємо подію в Google Calendar (в фоні, без блокування)
-            if status == "done" and req["departure_date"]:
-                title = f"Заявка №{req_id} — {req['location'] or 'N/A'} → {req['destination'] or 'N/A'}"
-                description = (
-                    f"Тип: {'🚖 Пасажирські перевезення' if req['req_type'] == 'passenger' else '📦 Посилка'}\n"
-                    f"Місто: {req['location']}\n"
-                    f"Адреса: {req['address']}\n"
-                    f"Телефон: {req['phone']}\n"
-                    f"Розміри: {req['dimensions']}\n"
-                    f"Вага: {req['weight']} кг\n"
-                    f"Пункт призначення: {req['destination']}\n"
-                    f"Користувач: @{req['username'] or req['user_id']}"
-                )
-                # Запускаємо в фоні без блокування
-                asyncio.create_task(
-                    create_calendar_event_async(title, description, req["departure_date"], callback.message)
-                )
-
-    except ValueError as e:
-        logger.error(f"❌ Помилка парсингу callback_data: {e}")
-        await callback.answer("❌ Помилка обробки запиту.")
-    except Exception as e:
-        logger.error(f"❌ Помилка при зміні статусу: {e}")
-        await callback.answer("❌ Помилка при оновленні статусу.")
-
-
-# ------------------------------------------------------------------
-# ЗАПУСК
-# ------------------------------------------------------------------
-
-async def main():
-    if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        raise SystemExit(
-            "❌ ПОМИЛКА: Вкажіть токен бота у змінній середовища BOT_TOKEN або у файлі .env (див. README.md)."
+        weight = float(message.text)
+        await state.update_data(weight=weight)
+        await message.answer(
+            "📝 Введіть опис посилки:",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="🔙 Назад")]],
+                resize_keyboard=True
+            )
         )
-    if not ADMIN_CHAT_IDS or ADMIN_CHAT_IDS == [0]:
-        logger.warning("⚠️ ADMIN_CHAT_IDS не налаштовано. Заявки будуть зберігатися, але адміни їх не отримуватимуть.")
+        await state.set_state(RequestForm.parcel_description)
+    except ValueError:
+        await message.answer("❌ Будь ласка, введіть числове значення:")
 
-    logger.info("🚀 Запускаємо GlobexTrans Bot...")
-    init_db()
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.message.middleware(ThrottlingMiddleware())
-    dp.include_router(router)
+@router.message(RequestForm.parcel_description)
+async def parcel_description_input(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("⚖️ Введіть вагу посилки (в кг):")
+        await state.set_state(RequestForm.parcel_weight)
+        return
+
+    await state.update_data(parcel_description=message.text)
+    await finalize_request(message, state)
+
+@router.message(RequestForm.parcel_from_city)
+async def parcel_from_city_input(message: types.Message, state: FSMContext):
+    if message.text == "🔙 Назад":
+        await message.answer("📦 З якої країни відправляємо посилку?", reply_markup=parcel_countries_keyboard())
+        await state.set_state(RequestForm.parcel_country)
+        return
+
+    await state.update_data(location=message.text)
+    await message.answer(
+        "🎯 Введіть місто призначення (Україна):",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="🔙 Назад")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(RequestForm.destination)
+
+async def finalize_request(message: types.Message, state: FSMContext):
+    """Збереження заявки в БД (async)"""
+    data = await state.get_data()
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            INSERT INTO requests (user_id, username, direction, location, phone, has_baggage, baggage_quantity, weight, destination, departure_date, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        ''', (
+            message.from_user.id,
+            message.from_user.username or "unknown",
+            data.get('direction') or data.get('parcel_country'),
+            data.get('location'),
+            data.get('phone'),
+            data.get('has_baggage', False),
+            data.get('baggage_quantity', 0),
+            data.get('weight', 0),
+            data.get('destination'),
+            data.get('departure_date')
+        ))
+        await db.commit()
+        
+        cursor = await db.execute('SELECT last_insert_rowid()')
+        row = await cursor.fetchone()
+        request_id = row[0]
+        
+        await db.execute('INSERT INTO status_log (request_id, status) VALUES (?, ?)', (request_id, 'pending'))
+        await db.commit()
+
+    await message.answer(
+        f"✅ Вашу заявку прийнято! Номер заявки: #{request_id}",
+        reply_markup=main_keyboard()
+    )
+
+    await state.clear()
+    asyncio.create_task(notify_admin(message.bot, request_id, data))
+
+async def notify_admin(bot, request_id, data):
+    """Асинхронне сповіщення адміну"""
+    message_text = (
+        f"📋 Нова заявка #{request_id}\n"
+        f"Користувач: @{data.get('username', 'unknown')}\n"
+        f"ID: {data.get('user_id')}\n"
+        f"Напрямок: {data.get('direction') or data.get('parcel_country')}\n"
+        f"Локація: {data.get('location')}\n"
+        f"Телефон: {data.get('phone')}\n"
+        f"Багаж: {'Так' if data.get('has_baggage') else 'Ні'}\n"
+        f"Кількість: {data.get('baggage_quantity')}\n"
+        f"Вага: {data.get('weight')} кг\n"
+        f"Призначення: {data.get('destination')}\n"
+        f"Дата відправлення: {data.get('departure_date')}\n"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Прийняти", callback_data=f"accept_{request_id}"),
+             InlineKeyboardButton(text="❌ Відхилити", callback_data=f"reject_{request_id}")]
+        ]
+    )
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("✅ Бот запустився. Чекаємо повідомлень...")
-        await dp.start_polling(bot)
+        await bot.send_message(ADMIN_ID, message_text, reply_markup=keyboard)
     except Exception as e:
-        logger.error(f"❌ КРИТИЧНА ПОМИЛКА: {e}")
-        raise
-    finally:
-        await bot.session.close()
+        logger.error(f"Error sending admin notification: {e}")
 
+@router.callback_query(F.data.startswith("accept_"))
+async def accept_request(callback_query: types.CallbackQuery):
+    request_id = int(callback_query.data.split("_")[1])
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('UPDATE requests SET status = ? WHERE id = ?', ('accepted', request_id))
+        await db.execute('INSERT INTO status_log (request_id, status) VALUES (?, ?)', (request_id, 'accepted'))
+        await db.commit()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    await callback_query.answer("✅ Заявка прийнята")
+    await callback_query.message.edit_text(f"✅ Заявка #{request_id} прийнята")
+
+@router.callback_query(F.data.startswith("reject_"))
+async def reject_request(callback_query: types.CallbackQuery):
+    request_id = int(callback_query.data.split("_")[1])
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('UPDATE requests SET status = ? WHERE id = ?', ('rejected', request_id))
+        await db.execute('INSERT INTO status_log (request_id, status) VALUES (?, ?)', (request_id, 'rejected'))
+        await db.commit()
+
+    await callback_query.answer("❌ Заявка відхилена")
+    await callback_query.message.edit_text(f"❌ Заявка #{request_id} відхилена")
+
+@router.message(F.text == "🔙 Назад")
+async def go_back(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Головне меню:", reply_markup=main_keyboard())
+
+@router.message(F.text.in_(["ℹ️ Про нас", "📞 Контакти"]))
+async def info(message: types.Message):
+    if message.text == "ℹ️ Про нас":
+        await message.answer(
+            "🚌 GlobexTrans — сервіс перевезень між Україною та Німеччиною\n\n"
+            "Ми забезпечуємо надійні та безпечні перевезення пасажирів та посилок."
+        )
+    else:
+        await message.answer(
+            "📞 Контакти:\n"
+            "Телефон: +49 123 456789\n"
+            "Email: info@globextrans.de"
+        )
