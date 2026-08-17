@@ -1,4 +1,4 @@
-code = '''import asyncio
+import asyncio
 import logging
 import os
 import time
@@ -928,7 +928,7 @@ async def parcel_de_city(message: Message, state: FSMContext):
         return
     await state.update_data(parcel_de_city=message.text)
     await state.set_state(RequestForm.parcel_de_street)
-    await message.answer("<ctrl42> Вулиця:", reply_markup=cancel_kb())
+    await message.answer("🛣️ Вулиця:", reply_markup=cancel_kb())
 
 
 @router.message(RequestForm.parcel_de_street)
@@ -1038,6 +1038,8 @@ async def main():
 
     bot = Bot(token=BOT_TOKEN)
     try:
+        # Очищаємо завислі оновлення та вебхуки, щоб уникнути конфліктів
+        await bot.delete_webhook(drop_pending_updates=True)
         logger.info("🚀 Бот запущено!")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
