@@ -1,4 +1,4 @@
-import asyncio
+code = '''import asyncio
 import logging
 import os
 import time
@@ -292,10 +292,10 @@ class RequestForm(StatesGroup):
     ua_city_name = State()
     ua_street = State()
     ua_house_number = State()
-    ua_phone = State()
     ua_has_baggage = State()
     ua_baggage_quantity = State()
     ua_baggage_weight = State()
+    ua_phone = State()
 
     # Сценарій 2: Німеччина -> Україна
     de_postal_code = State()
@@ -589,7 +589,11 @@ async def form_ua_pickup_choice(message: Message, state: FSMContext):
         await state.update_data(location="Львів")
         await state.set_state(RequestForm.ua_lviv_pickup)
         await message.answer("🏙️ Оберіть локацію посадки у Львові:", reply_markup=lviv_pickup_kb())
-    elif pickup in ["Івано-Франківськ", "Львівська область", "Івано-Франківська область", "Інші міста"]:
+    elif pickup == "Івано-Франківськ":
+        await state.update_data(location="Івано-Франківськ", address="Центральний збір / за адресою")
+        await state.set_state(RequestForm.ua_has_baggage)
+        await message.answer("🎒 Чи буде з вами багаж?", reply_markup=baggage_choice_kb())
+    elif pickup in ["Львівська область", "Івано-Франківська область", "Інші міста"]:
         await state.update_data(location=pickup)
         await state.set_state(RequestForm.ua_city_name)
         await message.answer("🏙️ Введіть назву населеного пункту:", reply_markup=cancel_kb())
@@ -601,8 +605,8 @@ async def form_ua_pickup_choice(message: Message, state: FSMContext):
 async def form_ua_lviv_pickup(message: Message, state: FSMContext):
     if message.text in ["Ж/Д вокзал", "Автовокзал (вул. Стрийська)"]:
         await state.update_data(address=message.text)
-        await state.set_state(RequestForm.ua_phone)
-        await message.answer("📱 Контактний номер телефону:", reply_markup=phone_kb())
+        await state.set_state(RequestForm.ua_has_baggage)
+        await message.answer("🎒 Чи буде з вами багаж?", reply_markup=baggage_choice_kb())
     else:
         await message.answer("❌ Оберіть локацію з кнопок!")
 
@@ -613,9 +617,8 @@ async def form_ua_city_name(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     loc = data.get("location", "")
-    is_other_city = loc == "Інші міста"
-    full_loc = f"{loc} ({message.text})" if "область" in loc or is_other_city else message.text
-    await state.update_data(location=full_loc, is_other_city=is_other_city)
+    full_loc = f"{loc} ({message.text})" if "область" in loc or loc == "Інші міста" else message.text
+    await state.update_data(location=full_loc)
     await state.set_state(RequestForm.ua_street)
     await message.answer("🛣️ Введіть назву вулиці:", reply_markup=cancel_kb())
 
@@ -637,21 +640,8 @@ async def form_ua_house_number(message: Message, state: FSMContext):
     street = data.get("ua_street", "")
     full_address = f"вул. {street}, буд. {message.text}"
     await state.update_data(address=full_address)
-    await state.set_state(RequestForm.ua_phone)
-    await message.answer("📱 Контактний номер телефону:", reply_markup=phone_kb())
-
-
-@router.message(RequestForm.ua_phone)
-async def form_ua_phone(message: Message, state: FSMContext, bot: Bot):
-    phone = message.contact.phone_number if message.contact else message.text
-    await state.update_data(phone=phone)
-    data = await state.get_data()
-
-    if data.get("is_other_city"):
-        await finalize_other_city_request(message, state, message.from_user, bot)
-    else:
-        await state.set_state(RequestForm.ua_has_baggage)
-        await message.answer("🎒 Чи буде з вами багаж?", reply_markup=baggage_choice_kb())
+    await state.set_state(RequestForm.ua_has_baggage)
+    await message.answer("🎒 Чи буде з вами багаж?", reply_markup=baggage_choice_kb())
 
 
 @router.message(RequestForm.ua_has_baggage)
@@ -662,8 +652,8 @@ async def form_ua_has_baggage(message: Message, state: FSMContext):
         await message.answer("📦 Скільки одиниць багажу (шт.):", reply_markup=cancel_kb())
     elif "Ні" in message.text:
         await state.update_data(has_baggage=False, dimensions="0 шт.", weight="0 кг")
-        await state.set_state(RequestForm.departure_date)
-        await message.answer("📅 Оберіть дату відправлення:", reply_markup=date_choice_kb("ukraine"))
+        await state.set_state(RequestForm.ua_phone)
+        await message.answer("📱 Контактний номер телефону:", reply_markup=phone_kb())
     else:
         await message.answer("❌ Оберіть з кнопок!")
 
@@ -682,6 +672,14 @@ async def form_ua_baggage_weight(message: Message, state: FSMContext):
     if await is_too_long(message):
         return
     await state.update_data(weight=f"{message.text} кг")
+    await state.set_state(RequestForm.ua_phone)
+    await message.answer("📱 Контактний номер телефону:", reply_markup=phone_kb())
+
+
+@router.message(RequestForm.ua_phone)
+async def form_ua_phone(message: Message, state: FSMContext):
+    phone = message.contact.phone_number if message.contact else message.text
+    await state.update_data(phone=phone)
     await state.set_state(RequestForm.departure_date)
     await message.answer("📅 Оберіть дату відправлення:", reply_markup=date_choice_kb("ukraine"))
 
@@ -729,14 +727,6 @@ async def form_de_house_number(message: Message, state: FSMContext):
     full_address = f"вул. {street}, буд. {message.text}"
     await state.update_data(location=full_loc, address=full_address)
 
-    await state.set_state(RequestForm.de_phone)
-    await message.answer("📱 Контактний номер телефону:", reply_markup=phone_kb())
-
-
-@router.message(RequestForm.de_phone)
-async def form_de_phone(message: Message, state: FSMContext):
-    phone = message.contact.phone_number if message.contact else message.text
-    await state.update_data(phone=phone)
     await state.set_state(RequestForm.de_baggage_quantity)
     await message.answer("📦 Орієнтовна кількість багажу (шт.):", reply_markup=cancel_kb())
 
@@ -755,6 +745,14 @@ async def form_de_baggage_weight(message: Message, state: FSMContext):
     if await is_too_long(message):
         return
     await state.update_data(weight=f"{message.text} кг")
+    await state.set_state(RequestForm.de_phone)
+    await message.answer("📱 Контактний номер телефону:", reply_markup=phone_kb())
+
+
+@router.message(RequestForm.de_phone)
+async def form_de_phone(message: Message, state: FSMContext):
+    phone = message.contact.phone_number if message.contact else message.text
+    await state.update_data(phone=phone)
     await state.set_state(RequestForm.de_destination_choice)
     await message.answer("🏁 Оберіть куди їхати (пункт призначення в Україні):", reply_markup=de_destination_kb())
 
@@ -787,43 +785,6 @@ async def form_departure_date(query: CallbackQuery, state: FSMContext, bot: Bot)
     await query.answer()
 
 
-async def finalize_other_city_request(message: Message, state: FSMContext, user, bot: Bot):
-    """Завершення заявки для 'Інші міста' без багажу та дати"""
-    data = await state.get_data()
-    data["destination"] = "Німеччина"
-    data["departure_date"] = None
-    data["has_baggage"] = False
-    data["dimensions"] = "0"
-    data["weight"] = "0"
-
-    req_id = await save_request(data)
-
-    await message.answer(
-        f"✅ <b>Заявка #{req_id} успішно зареєстрована!</b>\n\n"
-        f"Команда <b>GlobexTrans</b> зв'яжеться з вами найближчим часом для уточнення деталей доставки та розрахунку вартості.",
-        parse_mode="HTML",
-        reply_markup=type_choice_kb()
-    )
-
-    admin_msg = (
-        f"🚖 <b>Нова заявка на пасажирські перевезення (інші міста) #{req_id}</b>\n\n"
-        f"<b>Користувач:</b> @{data.get('username', 'невідомо')} ({user.id})\n"
-        f"<b>Пасажирів:</b> {data.get('passenger_count', '1')}\n"
-        f"<b>Місто/область:</b> {data.get('location', 'N/A')}\n"
-        f"<b>Адреса:</b> {data.get('address', 'N/A')}\n"
-        f"<b>Телефон:</b> {data.get('phone', 'N/A')}\n"
-        f"<b>Пункт призначення:</b> Німеччина"
-    )
-
-    for admin_id in ADMIN_CHAT_IDS:
-        try:
-            await bot.send_message(admin_id, admin_msg, parse_mode="HTML", reply_markup=admin_status_kb(req_id))
-        except Exception as e:
-            logger.error(f"❌ Не вдалось надіслати повідомлення адміну {admin_id}: {e}")
-
-    await state.clear()
-
-
 async def finalize_request(message: Message, state: FSMContext, user, bot: Bot):
     data = await state.get_data()
 
@@ -842,8 +803,8 @@ async def finalize_request(message: Message, state: FSMContext, user, bot: Bot):
         f"<b>Пасажирів:</b> {data.get('passenger_count', '1')}\n"
         f"<b>Пункт відправлення:</b> {data.get('location', 'N/A')}\n"
         f"<b>Адреса/Посадка:</b> {data.get('address', 'N/A')}\n"
-        f"<b>Телефон:</b> {data.get('phone', 'N/A')}\n"
         f"<b>Багаж:</b> {baggage_info}\n"
+        f"<b>Телефон:</b> {data.get('phone', 'N/A')}\n"
         f"<b>Пункт призначення:</b> {data.get('destination', 'N/A')}\n"
         f"<b>Дата виїзду:</b> {data.get('departure_date', 'N/A')}"
     )
@@ -857,8 +818,8 @@ async def finalize_request(message: Message, state: FSMContext, user, bot: Bot):
         f"<b>Пасажирів:</b> {data.get('passenger_count', '1')}\n"
         f"<b>Відправлення:</b> {data.get('location', 'N/A')}\n"
         f"<b>Адреса/Посадка:</b> {data.get('address', 'N/A')}\n"
-        f"<b>Телефон:</b> {data.get('phone', 'N/A')}\n"
         f"<b>Багаж:</b> {baggage_info}\n"
+        f"<b>Телефон:</b> {data.get('phone', 'N/A')}\n"
         f"<b>Призначення:</b> {data.get('destination', 'N/A')}\n"
         f"<b>Дата виїзду:</b> {data.get('departure_date', 'N/A')}"
     )
@@ -967,7 +928,7 @@ async def parcel_de_city(message: Message, state: FSMContext):
         return
     await state.update_data(parcel_de_city=message.text)
     await state.set_state(RequestForm.parcel_de_street)
-    await message.answer("🛣️ Вулиця:", reply_markup=cancel_kb())
+    await message.answer("<ctrl42> Вулиця:", reply_markup=cancel_kb())
 
 
 @router.message(RequestForm.parcel_de_street)
@@ -1085,3 +1046,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+'''
