@@ -326,8 +326,17 @@ class RequestForm(StatesGroup):
     departure_date = State()
 
     # Посилки
+    parcel_country_choice = State()  # Вибір країни для посилок
     parcel_city_choice = State()
     parcel_phone = State()
+
+    # Посилки Німеччина
+    parcel_de_postal_code = State()
+    parcel_de_city = State()
+    parcel_de_street = State()
+    parcel_de_house_number = State()
+    parcel_de_quantity = State()
+    parcel_de_weight = State()
 
     # "Не має міста"
     not_found_city = State()
@@ -381,6 +390,16 @@ def parcel_city_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="🏙️ Івано-Франківськ", callback_data="parcel_city:if")],
             [InlineKeyboardButton(text="📍 Інші міста", callback_data="parcel_city:other")],
+        ]
+    )
+
+
+def parcel_country_kb() -> InlineKeyboardMarkup:
+    """Вибір країни для посилок"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🇺🇦 Україна", callback_data="parcel_country:ukraine")],
+            [InlineKeyboardButton(text="🇩🇪 Німеччина", callback_data="parcel_country:germany")],
         ]
     )
 
@@ -546,10 +565,10 @@ async def start_form(message: Message, state: FSMContext):
         )
     else:
         # Посилки
-        await state.set_state(RequestForm.parcel_city_choice)
+        await state.set_state(RequestForm.parcel_country_choice)
         await message.answer(
             "📦 Звідки ви хочете відправити посилку?",
-            reply_markup=parcel_city_kb(),
+            reply_markup=parcel_country_kb(),
         )
 
 
@@ -609,6 +628,32 @@ async def form_location_choice(callback: CallbackQuery, state: FSMContext):
                 "🏠 Введіть адресу (вулиця, номер дому):",
                 reply_markup=cancel_kb(),
             )
+
+
+@router.callback_query(RequestForm.parcel_country_choice, F.data.startswith("parcel_country:"))
+async def form_parcel_country_choice(callback: CallbackQuery, state: FSMContext):
+    """Обробка вибору країни для посилок"""
+    country_choice = callback.data.split(":", 1)[1]
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer()
+
+    if country_choice == "ukraine":
+        # Україна
+        await state.update_data(direction="ukraine")
+        await state.set_state(RequestForm.parcel_city_choice)
+        await callback.message.answer(
+            "🏙️ Звідки ви хочете відправити посилку?",
+            reply_markup=parcel_city_kb(),
+        )
+    else:
+        # Німеччина
+        await state.update_data(direction="germany")
+        await state.set_state(RequestForm.parcel_de_postal_code)
+        await callback.message.answer(
+            "📮 Введіть поштовий код (PLZ):",
+            reply_markup=cancel_kb(),
+        )
 
 
 @router.callback_query(RequestForm.parcel_city_choice, F.data.startswith("parcel_city:"))
@@ -723,6 +768,117 @@ async def form_parcel_phone_text(message: Message, state: FSMContext, bot: Bot):
         f"<b>Нова заявка</b> №{req_id} — {kind}\n\n"
         f"Місто: {data.get('location')}\n"
         f"Телефон: {data.get('phone')}\n"
+        f"Користувач: @{message.from_user.username or message.from_user.id}"
+    )
+    await notify_admins(bot, text, req_id)
+
+
+# ------------------------------------------------------------------
+# ПОСИЛКИ З НІМЕЧЧИНИ
+# ------------------------------------------------------------------
+
+@router.message(RequestForm.parcel_de_postal_code)
+async def form_parcel_de_postal_code(message: Message, state: FSMContext):
+    """Поштовий код для Німеччини"""
+    if await is_too_long(message):
+        return
+
+    await state.update_data(location=message.text)
+    await state.set_state(RequestForm.parcel_de_city)
+    await message.answer(
+        "🏙️ Введіть місто:",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(RequestForm.parcel_de_city)
+async def form_parcel_de_city(message: Message, state: FSMContext):
+    """Місто для Німеччини"""
+    if await is_too_long(message):
+        return
+
+    data = await state.get_data()
+    postal_code = data.get("location", "")
+    await state.update_data(address=f"{postal_code} {message.text}")
+    await state.set_state(RequestForm.parcel_de_street)
+    await message.answer(
+        "🛣️ Введіть вулицю:",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(RequestForm.parcel_de_street)
+async def form_parcel_de_street(message: Message, state: FSMContext):
+    """Вулиця для Німеччини"""
+    if await is_too_long(message):
+        return
+
+    data = await state.get_data()
+    current_address = data.get("address", "")
+    await state.update_data(address=f"{current_address}, {message.text}")
+    await state.set_state(RequestForm.parcel_de_house_number)
+    await message.answer(
+        "🏠 Введіть номер будинку:",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(RequestForm.parcel_de_house_number)
+async def form_parcel_de_house_number(message: Message, state: FSMContext):
+    """Номер будинку для Німеччини"""
+    if await is_too_long(message):
+        return
+
+    data = await state.get_data()
+    current_address = data.get("address", "")
+    await state.update_data(address=f"{current_address} {message.text}")
+    await state.set_state(RequestForm.parcel_de_quantity)
+    await message.answer(
+        "📦 Кількість посилок:",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(RequestForm.parcel_de_quantity)
+async def form_parcel_de_quantity(message: Message, state: FSMContext):
+    """Кількість посилок"""
+    if await is_too_long(message):
+        return
+
+    await state.update_data(dimensions=message.text)
+    await state.set_state(RequestForm.parcel_de_weight)
+    await message.answer(
+        "⚖️ Орієнтовна вага (кг):",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(RequestForm.parcel_de_weight)
+async def form_parcel_de_weight(message: Message, state: FSMContext, bot: Bot):
+    """Вага для Німеччини - завершення форми"""
+    if await is_too_long(message):
+        return
+
+    await state.update_data(weight=message.text)
+    data = await state.get_data()
+    req_id = save_request(data)
+    await state.clear()
+
+    await message.answer(
+        f"✅ Дякуємо!\n\n"
+        f"Вашу заявку №{req_id} прийнято. "
+        f"Очікуйте, команда GlobexTrans звʼяжеться з вами найближчим часом.",
+        reply_markup=type_choice_kb(),
+    )
+    logger.info(f"📦 Заявка посилки з Німеччини від користувача {message.from_user.id}: #{req_id}")
+
+    # Повідомляємо адмінів
+    kind = "📦 Посилка (Німеччина)"
+    text = (
+        f"<b>Нова заявка</b> №{req_id} — {kind}\n\n"
+        f"Адреса: {data.get('address')}\n"
+        f"Кількість посилок: {data.get('dimensions')}\n"
+        f"Вага: {data.get('weight')} кг\n"
         f"Користувач: @{message.from_user.username or message.from_user.id}"
     )
     await notify_admins(bot, text, req_id)
