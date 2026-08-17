@@ -315,12 +315,13 @@ class RequestForm(StatesGroup):
     direction = State()
 
     # Пасажирські
-    location_choice = State()
-    custom_city = State()
-    address = State()
+    postal_code = State()
+    city = State()
+    street = State()
+    house_number = State()
     phone = State()
     has_baggage = State()
-    dimensions = State()
+    baggage_quantity = State()
     weight = State()
     destination = State()
     departure_date = State()
@@ -583,51 +584,69 @@ async def form_direction(message: Message, state: FSMContext):
         return
 
     await state.update_data(direction=direction)
-    await state.set_state(RequestForm.location_choice)
+    await state.set_state(RequestForm.postal_code)
     await message.answer(
-        "📍 Обберіть місто або область:",
-        reply_markup=ukraine_cities_kb(),
+        "📮 Введіть поштовий код:",
+        reply_markup=cancel_kb(),
     )
 
 
-@router.callback_query(RequestForm.location_choice, F.data.startswith("city:"))
-async def form_location_choice(callback: CallbackQuery, state: FSMContext):
-    city_choice = callback.data.split(":", 1)[1]
+@router.message(RequestForm.postal_code)
+async def form_postal_code(message: Message, state: FSMContext):
+    if await is_too_long(message):
+        return
 
-    if city_choice == "not_found":
-        await state.set_state(RequestForm.not_found_city)
-        await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.answer()
-        await callback.message.answer(
-            "📍 Не має вашого міста\n\nВкажіть своє місто/село:",
-            reply_markup=cancel_kb(),
-        )
-    else:
-        city_labels = {
-            "lviv": "Львів",
-            "ivano_frankivsk": "Івано-Франківськ",
-            "lviv_region": "Львівська область",
-            "ivano_frankivsk_region": "Івано-Франківська область",
-        }
+    await state.update_data(location=message.text)
+    await state.set_state(RequestForm.city)
+    await message.answer(
+        "🏙️ Введіть місто/село:",
+        reply_markup=cancel_kb(),
+    )
 
-        await state.update_data(location=city_labels.get(city_choice, city_choice))
 
-        if "region" in city_choice:
-            await state.set_state(RequestForm.custom_city)
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.answer()
-            await callback.message.answer(
-                "🏘️ Вкажіть місто або село в області:",
-                reply_markup=cancel_kb(),
-            )
-        else:
-            await state.set_state(RequestForm.address)
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.answer()
-            await callback.message.answer(
-                "🏠 Введіть адресу (вулиця, номер дому):",
-                reply_markup=cancel_kb(),
-            )
+@router.message(RequestForm.city)
+async def form_city(message: Message, state: FSMContext):
+    if await is_too_long(message):
+        return
+
+    data = await state.get_data()
+    postal_code = data.get("location", "")
+    await state.update_data(location=f"{postal_code} {message.text}")
+    await state.set_state(RequestForm.street)
+    await message.answer(
+        "🛣️ Введіть вулицю:",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(RequestForm.street)
+async def form_street(message: Message, state: FSMContext):
+    if await is_too_long(message):
+        return
+
+    data = await state.get_data()
+    current_location = data.get("location", "")
+    await state.update_data(location=f"{current_location}, {message.text}")
+    await state.set_state(RequestForm.house_number)
+    await message.answer(
+        "🏠 Введіть номер будинку:",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(RequestForm.house_number)
+async def form_house_number(message: Message, state: FSMContext):
+    if await is_too_long(message):
+        return
+
+    data = await state.get_data()
+    current_location = data.get("location", "")
+    await state.update_data(location=f"{current_location} {message.text}")
+    await state.set_state(RequestForm.phone)
+    await message.answer(
+        "📱 Контактний номер телефону?",
+        reply_markup=phone_kb(),
+    )
 
 
 @router.callback_query(RequestForm.parcel_country_choice, F.data.startswith("parcel_country:"))
@@ -942,7 +961,7 @@ async def form_has_baggage(message: Message, state: FSMContext):
     if "Так" in message.text or "так" in message.text:
         # Буде багаж — запитуємо кількість
         await state.update_data(has_baggage=True)
-        await state.set_state(RequestForm.dimensions)
+        await state.set_state(RequestForm.baggage_quantity)
         await message.answer(
             "🛄 Скільки вас буде з багажем? (кількість осіб/багажних одиниць):",
             reply_markup=ReplyKeyboardRemove(),
@@ -959,8 +978,8 @@ async def form_has_baggage(message: Message, state: FSMContext):
         await message.answer("❌ Обберіть з кнопок!")
 
 
-@router.message(RequestForm.dimensions)
-async def form_dimensions(message: Message, state: FSMContext):
+@router.message(RequestForm.baggage_quantity)
+async def form_baggage_quantity(message: Message, state: FSMContext):
     if await is_too_long(message):
         return
     await state.update_data(dimensions=message.text)
