@@ -1,10 +1,7 @@
 import logging
 import asyncio
 import sqlite3
-import os
-import json
 from datetime import datetime, timedelta
-from pathlib import Path
 from aiogram import F, Router, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -16,10 +13,7 @@ from google.oauth2.service_account import Credentials
 from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-import aiosqlite
-from dotenv import load_dotenv
-
-load_dotenv()
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,67 +24,60 @@ DB_NAME = "globextrans.db"
 GOOGLE_CREDENTIALS_FILE = "service_account.json"
 CALENDAR_ID = "primary"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN must be set in .env file")
+FIXED_DEPARTURE_DATES = {
+    "ukraine": [
+        "2024-11-25",
+        "2024-12-02",
+        "2024-12-09",
+        "2024-12-16",
+    ],
+    "germany": [
+        "2024-11-20",
+        "2024-11-27",
+        "2024-12-04",
+        "2024-12-11",
+    ]
+}
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-if ADMIN_ID == 0:
-    raise ValueError("ADMIN_ID must be set in .env file")
+def get_db_connection():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def get_dynamic_departure_dates(direction):
-    """Динамічний розрахунок дат відправлення"""
-    today = datetime.now()
-    dates = []
-    
-    # Генеруємо дати на 3 місяці вперед
-    for i in range(13):
-        date = today + timedelta(weeks=i)
-        formatted_date = date.strftime("%Y-%m-%d")
-        dates.append(formatted_date)
-    
-    return dates
-
-async def init_db():
-    """Ініціалізація БД з aiosqlite"""
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                username TEXT,
-                direction TEXT,
-                location TEXT,
-                phone TEXT,
-                has_baggage BOOLEAN,
-                baggage_quantity INTEGER,
-                weight REAL,
-                destination TEXT,
-                departure_date TEXT,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS status_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                request_id INTEGER,
-                status TEXT,
-                changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (request_id) REFERENCES requests(id)
-            )
-        ''')
-        await db.commit()
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            direction TEXT,
+            location TEXT,
+            phone TEXT,
+            has_baggage BOOLEAN,
+            baggage_quantity INTEGER,
+            weight REAL,
+            destination TEXT,
+            departure_date TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS status_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER,
+            status TEXT,
+            changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (request_id) REFERENCES requests(id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
 def get_google_calendar_service():
-    """Google Calendar сервіс з готовим token.pickle"""
     try:
-        token_path = "token.pickle"
-        
-        if not os.path.exists(token_path):
-            logger.warning(f"Token file not found at {token_path}. Please generate it locally first.")
-            return None
-        
         credentials = Credentials.from_service_account_file(
             GOOGLE_CREDENTIALS_FILE,
             scopes=['https://www.googleapis.com/auth/calendar']
@@ -100,8 +87,7 @@ def get_google_calendar_service():
         logger.error(f"Error initializing Google Calendar service: {e}")
         return None
 
-async def check_calendar_availability(departure_date, direction):
-    """Перевірка доступності дати в календарі"""
+def check_calendar_availability(departure_date, direction):
     service = get_google_calendar_service()
     if not service:
         return True
@@ -196,9 +182,9 @@ def destinations_keyboard(direction):
     return keyboard
 
 def departure_dates_keyboard(direction):
-    dates = get_dynamic_departure_dates(direction)
+    dates = FIXED_DEPARTURE_DATES.get(direction, [])
     keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=date)] for date in dates[:8]],
+        keyboard=[[KeyboardButton(text=date)] for date in dates],
         resize_keyboard=True
     )
     return keyboard
@@ -479,16 +465,11 @@ async def parcel_city_input(message: types.Message, state: FSMContext):
     )
     await state.set_state(RequestForm.destination)
 
-@router.message(RequestForm.destination)
+@router.message(RequestForm.destination, StateFilter(RequestForm.parcel_city))
 async def parcel_destination_input(message: types.Message, state: FSMContext):
     if message.text == "🔙 Назад":
-        data = await state.get_data()
-        if data.get('parcel_city'):
-            await message.answer("🏙️ Введіть місто відправлення (Україна):")
-            await state.set_state(RequestForm.parcel_city)
-        elif data.get('parcel_from_city'):
-            await message.answer("🏙️ Введіть місто відправлення (Німеччина):")
-            await state.set_state(RequestForm.parcel_from_city)
+        await message.answer("🏙️ Введіть місто відправлення (Україна):")
+        await state.set_state(RequestForm.parcel_city)
         return
 
     await state.update_data(destination=message.text)
@@ -504,7 +485,7 @@ async def parcel_destination_input(message: types.Message, state: FSMContext):
 @router.message(RequestForm.parcel_phone)
 async def parcel_phone_input(message: types.Message, state: FSMContext):
     if message.text == "🔙 Назад":
-        await message.answer("🎯 Введіть місто призначення:")
+        await message.answer("🎯 Введіть місто призначення (Німеччина):")
         await state.set_state(RequestForm.destination)
         return
 
@@ -567,44 +548,42 @@ async def parcel_from_city_input(message: types.Message, state: FSMContext):
     await state.set_state(RequestForm.destination)
 
 async def finalize_request(message: types.Message, state: FSMContext):
-    """Збереження заявки в БД (async)"""
     data = await state.get_data()
-    
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('''
-            INSERT INTO requests (user_id, username, direction, location, phone, has_baggage, baggage_quantity, weight, destination, departure_date, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-        ''', (
-            message.from_user.id,
-            message.from_user.username or "unknown",
-            data.get('direction') or data.get('parcel_country'),
-            data.get('location'),
-            data.get('phone'),
-            data.get('has_baggage', False),
-            data.get('baggage_quantity', 0),
-            data.get('weight', 0),
-            data.get('destination'),
-            data.get('departure_date')
-        ))
-        await db.commit()
-        
-        cursor = await db.execute('SELECT last_insert_rowid()')
-        row = await cursor.fetchone()
-        request_id = row[0]
-        
-        await db.execute('INSERT INTO status_log (request_id, status) VALUES (?, ?)', (request_id, 'pending'))
-        await db.commit()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        INSERT INTO requests (user_id, username, direction, location, phone, has_baggage, baggage_quantity, weight, destination, departure_date, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+    ''', (
+        message.from_user.id,
+        message.from_user.username,
+        data.get('direction') or data.get('parcel_country'),
+        data.get('location'),
+        data.get('phone'),
+        data.get('has_baggage', False),
+        data.get('baggage_quantity', 0),
+        data.get('weight', 0),
+        data.get('destination'),
+        data.get('departure_date')
+    ))
+
+    request_id = cursor.lastrowid
+    cursor.execute('INSERT INTO status_log (request_id, status) VALUES (?, ?)', (request_id, 'pending'))
+    conn.commit()
+    conn.close()
 
     await message.answer(
-        f"✅ Вашу заявку прийнято! Номер заявки: #{request_id}",
+        "✅ Вашу заявку прийнято! Номер заявки: #{}".format(request_id),
         reply_markup=main_keyboard()
     )
 
     await state.clear()
+
     asyncio.create_task(notify_admin(message.bot, request_id, data))
 
 async def notify_admin(bot, request_id, data):
-    """Асинхронне сповіщення адміну"""
+    admin_id = 123456789
     message_text = (
         f"📋 Нова заявка #{request_id}\n"
         f"Користувач: @{data.get('username', 'unknown')}\n"
@@ -627,17 +606,19 @@ async def notify_admin(bot, request_id, data):
     )
 
     try:
-        await bot.send_message(ADMIN_ID, message_text, reply_markup=keyboard)
+        await bot.send_message(admin_id, message_text, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Error sending admin notification: {e}")
 
 @router.callback_query(F.data.startswith("accept_"))
 async def accept_request(callback_query: types.CallbackQuery):
     request_id = int(callback_query.data.split("_")[1])
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('UPDATE requests SET status = ? WHERE id = ?', ('accepted', request_id))
-        await db.execute('INSERT INTO status_log (request_id, status) VALUES (?, ?)', (request_id, 'accepted'))
-        await db.commit()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE requests SET status = ? WHERE id = ?', ('accepted', request_id))
+    cursor.execute('INSERT INTO status_log (request_id, status) VALUES (?, ?)', (request_id, 'accepted'))
+    conn.commit()
+    conn.close()
 
     await callback_query.answer("✅ Заявка прийнята")
     await callback_query.message.edit_text(f"✅ Заявка #{request_id} прийнята")
@@ -645,10 +626,12 @@ async def accept_request(callback_query: types.CallbackQuery):
 @router.callback_query(F.data.startswith("reject_"))
 async def reject_request(callback_query: types.CallbackQuery):
     request_id = int(callback_query.data.split("_")[1])
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('UPDATE requests SET status = ? WHERE id = ?', ('rejected', request_id))
-        await db.execute('INSERT INTO status_log (request_id, status) VALUES (?, ?)', (request_id, 'rejected'))
-        await db.commit()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('UPDATE requests SET status = ? WHERE id = ?', ('rejected', request_id))
+    cursor.execute('INSERT INTO status_log (request_id, status) VALUES (?, ?)', (request_id, 'rejected'))
+    conn.commit()
+    conn.close()
 
     await callback_query.answer("❌ Заявка відхилена")
     await callback_query.message.edit_text(f"❌ Заявка #{request_id} відхилена")
