@@ -816,8 +816,19 @@ async def parcel_city_choice(query: CallbackQuery, state: FSMContext):
     await state.update_data(parcel_city=city)
     await state.set_state(RequestForm.parcel_phone)
     await query.message.edit_text(
-        "📱 Контактний номер:",
-        reply_markup=phone_kb()
+        "📱 Контактний номер телефону?",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="📱 Надіслати мій номер", callback_data="phone_contact")]]
+        )
+    )
+    await query.answer()
+
+
+@router.callback_query(F.data == "phone_contact")
+async def phone_contact_button(query: CallbackQuery, state: FSMContext):
+    """Після натискання кнопки 'Надіслати мій номер' — перемикаємо на текстовий ввід"""
+    await query.message.edit_text(
+        "📱 Будь ласка, надішліть номер у форматі: +380XXXXXXXXX або +49XXXXXXXXXX"
     )
     await query.answer()
 
